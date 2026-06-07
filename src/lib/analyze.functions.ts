@@ -24,50 +24,121 @@ const SYSTEM_PROMPT = `You are an elite ATS (Applicant Tracking System) and care
 
 Be specific, data-driven, and use modern resume best practices (STAR method, metrics, strong verbs).`;
 
-export const analyzeResume = createServerFn({ method: "POST" })
-  .inputValidator((d: unknown) => InputSchema.parse(d))
-  .handler(async ({ data }) => {
-    const key = process.env.LOVABLE_API_KEY;
-    if (!key) throw new Error("AI service is not configured");
+const FALLBACK_MODEL = "gemini-2.5-flash-lite";
+const MAX_RETRIES = 2;
 
-    const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+function parseJsonContent(content: string) {
+  try {
+    return JSON.parse(content);
+  } catch {
+    const m = content.match(/\{[\s\S]*\}/);
+    return m ? JSON.parse(m[0]) : null;
+  }
+}
+
+function parseGeminiError(status: number, body: string): string {
+  try {
+    const err = JSON.parse(body)?.error;
+    if (err?.message) {
+      const detail = err.details?.find?.(
+        (d: { quotaMetric?: string; model?: string; limit?: number }) =>
+          d.quotaMetric?.includes("free_tier"),
+      );
+      if (detail?.limit === 0 && detail?.model) {
+        return `No free-tier quota for ${detail.model}. Set GEMINI_MODEL=${FALLBACK_MODEL} in .env and restart the dev server.`;
+      }
+      return err.message.split("\n")[0];
+    }
+  } catch {
+    // fall through
+  }
+  if (status === 429) return "Rate limit reached. Please try again shortly.";
+  if (status === 503) return "AI service is temporarily unavailable. Please try again shortly.";
+  return `AI request failed (${status})`;
+}
+
+function isRetryable(status: number, body: string): boolean {
+  if (status === 503 || status === 429) return true;
+  const msg = parseGeminiError(status, body).toLowerCase();
+  return msg.includes("high demand") || msg.includes("try again");
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function modelChain(): string[] {
+  const primary = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
+  return primary === FALLBACK_MODEL ? [primary] : [primary, FALLBACK_MODEL];
+}
+
+async function callGemini(apiKey: string, model: string, userPrompt: string) {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`,
+        "x-goog-api-key": apiKey,
       },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: `JOB DESCRIPTION:\n${data.jobDescription}\n\n---\n\nRESUME:\n${data.resumeText}\n\nReturn only the JSON object.`,
-          },
-        ],
-        response_format: { type: "json_object" },
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+        },
       }),
-    });
+    },
+  );
 
-    if (res.status === 429) throw new Error("Rate limit reached. Please try again shortly.");
-    if (res.status === 402) throw new Error("AI credits exhausted. Please add credits in your workspace.");
-    if (!res.ok) {
-      const t = await res.text();
-      throw new Error(`AI request failed: ${t.slice(0, 200)}`);
+  const body = await res.text();
+  if (!res.ok) {
+    return { ok: false as const, status: res.status, body };
+  }
+
+  const json = JSON.parse(body);
+  const content: string = json?.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+  const parsed = parseJsonContent(content);
+  if (!parsed) {
+    return {
+      ok: false as const,
+      status: 502,
+      body: JSON.stringify({ error: { message: "AI returned an unparseable response" } }),
+    };
+  }
+
+  return { ok: true as const, parsed };
+}
+
+async function generateAnalysis(apiKey: string, userPrompt: string) {
+  let lastError = "AI request failed";
+
+  for (const model of modelChain()) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const result = await callGemini(apiKey, model, userPrompt);
+
+      if (result.ok) return result.parsed;
+
+      lastError = parseGeminiError(result.status, result.body);
+
+      if (!isRetryable(result.status, result.body)) break;
+      if (attempt < MAX_RETRIES) {
+        await sleep(1500 * (attempt + 1));
+      }
+    }
+  }
+
+  throw new Error(lastError);
+}
+
+export const analyzeResume = createServerFn({ method: "POST" })
+  .inputValidator((d: unknown) => InputSchema.parse(d))
+  .handler(async ({ data }) => {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("AI service is not configured. Set GEMINI_API_KEY in .env");
     }
 
-    const json = await res.json();
-    const content: string = json?.choices?.[0]?.message?.content ?? "{}";
-
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      // try to find JSON inside
-      const m = content.match(/\{[\s\S]*\}/);
-      parsed = m ? JSON.parse(m[0]) : null;
-    }
-    if (!parsed) throw new Error("AI returned an unparseable response");
-
-    return parsed;
+    const userPrompt = `JOB DESCRIPTION:\n${data.jobDescription}\n\n---\n\nRESUME:\n${data.resumeText}\n\nReturn only the JSON object.`;
+    return generateAnalysis(key, userPrompt);
   });
