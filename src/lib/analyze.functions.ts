@@ -136,7 +136,7 @@ export const analyzeResume = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const key = process.env.GEMINI_API_KEY;
     if (!key) {
-      throw new Error("AI service is not configured. Set GEMINI_API_KEY in .env");
+      throw new Error("AI service is not configured. Set GEMINI_API_KEY in your environment (local .env or Cloudflare Worker secrets).");
     }
 
     const userPrompt = `JOB DESCRIPTION:\n${data.jobDescription}\n\n---\n\nRESUME:\n${data.resumeText}\n\nReturn only the JSON object.`;
